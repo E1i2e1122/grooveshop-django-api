@@ -1,14 +1,32 @@
+import asyncio
 import importlib
+import logging
 import os
 import pkgutil
 import time
 import traceback
 from types import ModuleType
+from typing import cast
+from typing import Dict
+from typing import List
+from typing import Optional
+from typing import Type
+from typing import TypeVar
 
+import factory
+from asgiref.sync import sync_to_async
 from django.apps import apps
+from django.conf import settings
 from django.core.management.base import BaseCommand
+from django.db import IntegrityError
+from django.db import models
 
-DEFAULT_COUNT = 10
+logger = logging.getLogger(__name__)
+
+DEFAULT_COUNT = settings.SEED_DEFAULT_COUNT
+BATCH_SIZE = settings.SEED_BATCH_SIZE
+
+F = TypeVar("F", bound=factory.django.DjangoModelFactory)
 
 
 class Command(BaseCommand):
@@ -27,12 +45,16 @@ class Command(BaseCommand):
             help="Comma-separated list of model-specific counts in the form 'ModelName1=10,ModelName2=100'",
         )
 
-    def handle(self, *args, **options):
+    async def handle_async(self, *args, **options):
+        self.stdout.write(self.style.NOTICE("Starting the seeding process...\n"))
         start_total_time = time.time()
         count = options["count"]
         model_counts = self.parse_model_counts(options["model_counts"])
-        available_models = self.get_available_models()
+        available_models = await self.get_available_models()
         success_messages = []
+        factory_timings: Dict[str, float] = {}
+
+        initial_counts = await self.get_initial_counts()
 
         for model_name in model_counts.keys():
             if model_name not in available_models:
@@ -45,52 +67,118 @@ class Command(BaseCommand):
 
         factory_modules = self.find_factory_modules()
 
+        created_counts: Dict[str, int] = {}
+
         for module_path in factory_modules:
-            try:
-                if not isinstance(module_path, str):
-                    continue
+            if isinstance(module_path, str):
+                result = await self.process_module(module_path, model_counts, count, created_counts, factory_timings)
+                if result:
+                    success_messages.extend(result)
 
-                module = importlib.import_module(module_path)
-                factory_classes = self.get_factory_classes(module)
-
-                for factory_class in factory_classes:
-                    model_name = factory_class._meta.model.__name__
-                    model_count = model_counts.get(model_name, count)
-
-                    start_time = time.time()
-                    created_count = 0
-                    for _ in range(model_count):
-                        try:
-                            instance = factory_class()
-                            if instance:
-                                created_count += 1
-                        except Exception as e:
-                            self.stdout.write(self.style.ERROR(f"Failed to create {model_name} instance: {str(e)}"))
-
-                    end_time = time.time()
-                    time_taken = end_time - start_time
-                    msg = (
-                        f'Successfully seeded "{model_name}" '
-                        f"with {created_count}/{model_count} records in {time_taken:.2f} seconds"
-                    )
-                    success_messages.append(self.style.SUCCESS(msg))
-
-            except Exception as e:
-                tb = traceback.format_exc()
-                error_message = f"Failed to seed using {module_path}: {str(e)}\n{tb}"
-                self.stdout.write(self.style.ERROR(error_message))
-
-        end_total_time = time.time()
-        total_time_taken = end_total_time - start_total_time
-        total_msg = f"Total seeding time: {total_time_taken:.2f} seconds"
-
-        # Print all success messages at the end
         for message in success_messages:
             self.stdout.write(message)
 
-        self.stdout.write(self.style.SUCCESS(total_msg))
+        total_time = time.time() - start_total_time
+        self.stdout.write(self.style.NOTICE("\nSeeding process completed.\n"))
 
-    def parse_model_counts(self, model_counts_str: str) -> dict[str, int]:
+        self.stdout.write(self.style.NOTICE("Created instances summary:"))
+        for factory_class, count in created_counts.items():
+            timing = factory_timings.get(factory_class, 0)
+            self.stdout.write(self.style.SUCCESS(f"{factory_class:<30} : {count:<5} ({timing:.2f}s)"))
+
+        await self.print_created_counts(initial_counts)
+
+        self.stdout.write(self.style.NOTICE(f"\nTotal seeding time: {total_time:.2f} seconds"))
+
+    async def process_module(
+        self,
+        module_path: str,
+        model_counts: Dict[str, int],
+        default_count: int,
+        created_counts: Dict[str, int],
+        factory_timings: Dict[str, float],
+    ) -> List[str]:
+        success_messages = []
+        module = importlib.import_module(module_path)
+        factory_classes = self.get_factory_classes(module)
+        if not factory_classes:
+            return success_messages
+
+        self.stdout.write(self.style.NOTICE(f"\nProcessing module: {module_path}"))
+        try:
+            for factory_class in factory_classes:
+                model_name = factory_class._meta.model.__name__  # type: ignore
+                if model_name.endswith("Translation"):
+                    continue
+                model_count = model_counts.get(model_name, default_count)
+
+                self.stdout.write(self.style.NOTICE(f"Running factory: {factory_class.__name__} for {model_name}"))
+
+                start_time = time.time()
+                await self.create_records(factory_class, model_count, created_counts)
+                elapsed_time = time.time() - start_time
+
+                factory_timings[factory_class.__name__] = elapsed_time
+
+        except Exception as e:
+            tb = traceback.format_exc()
+            error_message = f"Failed to seed using {module_path}: {str(e)}\n{tb}"
+            self.stdout.write(self.style.ERROR(error_message))
+            success_messages.append(self.style.ERROR(error_message))
+
+        return success_messages
+
+    async def create_records(self, factory_class: Type[F], count: int, created_counts: Dict[str, int]) -> int:
+        factory_name = factory_class.__name__
+        created_counts[factory_name] = created_counts.get(factory_name, 0)
+
+        self.stdout.write(self.style.NOTICE(f"Creating {count} records using {factory_name}"))
+
+        instances = []
+        for i in range(count):
+            try:
+                instance = await sync_to_async(factory_class.create)()  # type: ignore
+                await self.save_related_objects(instance)
+                instances.append(instance)
+
+                if len(instances) >= BATCH_SIZE:
+                    await self.save_batch(instances, factory_class)
+                    created_counts[factory_name] += len(instances)
+                    instances.clear()
+
+            except Exception as e:
+                error_message = (
+                    f"Failed to create {factory_class._meta.model.__name__} instance {i + 1}/{count}: {str(e)}"
+                )
+                self.stdout.write(self.style.ERROR(error_message))
+
+        if instances:
+            await self.save_batch(instances, factory_class)
+            created_counts[factory_name] += len(instances)
+
+        self.stdout.write(self.style.NOTICE(f"Completed creating {count} records using {factory_name}"))
+
+        return count
+
+    async def save_related_objects(self, instance: models.Model):
+        for field in instance._meta.get_fields():
+            if field.is_relation and field.many_to_one:
+                related_instance = getattr(instance, field.name)
+                if related_instance and not related_instance.pk:
+                    await sync_to_async(related_instance.save)()
+
+    async def save_batch(self, instances: List[models.Model], factory_class: Type[F]):
+        try:
+            await factory_class._meta.model.objects.abulk_create(instances, batch_size=BATCH_SIZE)
+            self.stdout.write(self.style.NOTICE(f"Saved batch of {len(instances)} records."))
+        except IntegrityError:
+            for instance in instances:
+                try:
+                    await sync_to_async(instance.save)()
+                except IntegrityError as e:
+                    self.stdout.write(self.style.ERROR(f"Failed to save instance: {str(e)}"))
+
+    def parse_model_counts(self, model_counts_str: Optional[str]) -> Dict[str, int]:
         if not model_counts_str:
             return {}
 
@@ -104,7 +192,7 @@ class Command(BaseCommand):
                 self.stdout.write(self.style.ERROR(f"Invalid format for model count: {pair}"))
         return model_counts
 
-    def find_factory_modules(self) -> list[str]:
+    def find_factory_modules(self) -> List[str]:
         factory_modules = []
         for app in apps.get_app_configs():
             app_path = app.module.__path__[0]
@@ -130,16 +218,16 @@ class Command(BaseCommand):
         return module_path
 
     @staticmethod
-    def get_factory_classes(module: ModuleType) -> list:
+    def get_factory_classes(module: ModuleType) -> List[Type[F]]:
         factory_classes = []
         for attr_name in dir(module):
             attr = getattr(module, attr_name)
             if hasattr(attr, "_meta") and hasattr(attr._meta, "model"):
                 if attr._meta.model is not None and "Factory" in attr.__name__:
-                    factory_classes.append(attr)
+                    factory_classes.append(cast(Type[F], attr))
         return factory_classes
 
-    def get_available_models(self) -> list[str]:
+    async def get_available_models(self) -> List[str]:
         available_models = []
         factory_modules = self.find_factory_modules()
         for module_path in factory_modules:
@@ -150,3 +238,30 @@ class Command(BaseCommand):
                 if not model_name.endswith("Translation"):
                     available_models.append(model_name)
         return available_models
+
+    async def get_initial_counts(self) -> Dict[str, int]:
+        initial_counts = {}
+        for model in apps.get_models():
+            model_name = model.__name__
+            if model_name.endswith("Translation"):
+                continue
+            count = await model.objects.acount()
+            initial_counts[model_name] = count
+        return initial_counts
+
+    async def print_created_counts(self, initial_counts: Dict[str, int]):
+        self.stdout.write(self.style.NOTICE("\nTotal records created in the database:"))
+        for model in apps.get_models():
+            model_name = model.__name__
+            if model_name.endswith("Translation"):
+                continue
+            initial_count = initial_counts.get(model_name, 0)
+            current_count = await model.objects.acount()
+            created_count = current_count - initial_count
+            if created_count > 0:
+                self.stdout.write(self.style.SUCCESS(f"{model_name:<30} : {created_count:<5}"))
+
+    def handle(self, *args, **options):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.handle_async(*args, **options))
+        self.stdout.write(self.style.SUCCESS("Seeding process completed successfully."))
