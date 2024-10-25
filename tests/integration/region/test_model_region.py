@@ -39,8 +39,3 @@ class RegionModelTestCase(TestCase):
         queryset = self.region.get_ordering_queryset()
         self.assertTrue(queryset.exists())
         self.assertTrue(self.region in queryset)
-
-    def tearDown(self) -> None:
-        Region.objects.all().delete()
-        Country.objects.all().delete()
-        super().tearDown()
