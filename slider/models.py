@@ -42,9 +42,6 @@ class Slider(TranslatableModel, TimeStampMixinModel, UUIDModel):
             *TimeStampMixinModel.Meta.indexes,
         ]
 
-    def __unicode__(self):
-        return self.safe_translation_getter("name", any_language=True) or ""
-
     def __str__(self):
         return self.safe_translation_getter("name", any_language=True) or ""
 
@@ -103,9 +100,6 @@ class Slide(TranslatableModel, TimeStampMixinModel, SortableModel, UUIDModel):
             BTreeIndex(fields=["date_start"]),
             BTreeIndex(fields=["date_end"]),
         ]
-
-    def __unicode__(self):
-        return f"{self.safe_translation_getter('title', any_language=True)} in {self.slider}"
 
     def __str__(self):
         return f"{self.safe_translation_getter('title', any_language=True)} in {self.slider}"

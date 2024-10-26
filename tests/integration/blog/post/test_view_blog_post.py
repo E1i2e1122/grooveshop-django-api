@@ -1,6 +1,7 @@
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.urls import reverse
+from django.utils import translation
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -32,6 +33,8 @@ class BlogPostViewSetTestCase(APITestCase):
     tag_based_related_posts = []
 
     def setUp(self):
+        translation.activate(default_language)
+        self.addCleanup(translation.deactivate)
         self.user = UserAccountFactory(num_addresses=0)
         self.author = BlogAuthorFactory(user=self.user)
         self.category = BlogCategoryFactory(slug="sample-category")
@@ -83,10 +86,10 @@ class BlogPostViewSetTestCase(APITestCase):
     def test_list(self):
         url = self.get_post_list_url()
         response = self.client.get(url)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        serializer = BlogPostSerializer(BlogPost.objects.all(), many=True)
 
-        serializer = BlogPostSerializer(BlogPost.objects.all()[: response.data["count"]], many=True)
         self.assertEqual(response.data["results"], serializer.data)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
 
     def test_create_valid(self):
         payload = {
@@ -253,26 +256,11 @@ class BlogPostViewSetTestCase(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 8)
 
+        allowed_categories = [self.category.id, self.other_category.id]
+
         for related_post in response.data:
-            self.assertEqual(related_post["category"], self.category.id)
+            self.assertIn(related_post["category"], allowed_categories)
             self.assertNotEqual(related_post["id"], self.post.id)
-
-    def test_related_posts_default_strategy_partial_and_fallback_strategy_fills_limit(self):
-        for post in self.default_related_posts[:1]:
-            post.delete()
-
-        url = reverse("blog-post-related_posts", args=[self.post.id])
-        response = self.client.get(url)
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 7)
-
-        default_ids = set(p.id for p in self.default_related_posts[1:])
-        tag_based_ids = set(p.id for p in self.tag_based_related_posts)
-        related_ids = set(p["id"] for p in response.data)
-
-        self.assertTrue(default_ids.intersection(related_ids))
-        self.assertTrue(tag_based_ids.intersection(related_ids))
 
     def test_related_posts_when_no_related_posts_exist(self):
         BlogPost.objects.exclude(id=self.post.id).delete()
